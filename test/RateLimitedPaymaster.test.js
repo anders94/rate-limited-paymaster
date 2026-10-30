@@ -32,6 +32,11 @@ describe("RateLimitedPaymaster", function () {
       expect(await paymaster.owner()).to.equal(owner.address);
     });
 
+    it("Should start unpaused", async function () {
+      const { paymaster } = await loadFixture(deployPaymasterFixture);
+      expect(await paymaster.paused()).to.be.false;
+    });
+
     it("Should have correct token balances", async function () {
       const { paymaster, token1, token2 } = await loadFixture(deployPaymasterFixture);
       expect(await token1.balanceOf(paymaster.target)).to.equal(ethers.parseEther("10000"));
@@ -42,10 +47,10 @@ describe("RateLimitedPaymaster", function () {
   describe("Key Authorization", function () {
     it("Should authorize a key with spending limits", async function () {
       const { paymaster, token1, owner, user1 } = await loadFixture(deployPaymasterFixture);
-      
+
       const amount = ethers.parseEther("100");
       const timeWindow = 3600; // 1 hour
-      
+
       await expect(paymaster.connect(owner).authorizeKey(user1.address, token1.target, amount, timeWindow))
         .to.emit(paymaster, "KeyAuthorized")
         .withArgs(user1.address, token1.target, amount, timeWindow);
@@ -58,25 +63,23 @@ describe("RateLimitedPaymaster", function () {
 
     it("Should reject authorization with zero amount", async function () {
       const { paymaster, token1, owner, user1 } = await loadFixture(deployPaymasterFixture);
-      
+
       await expect(paymaster.connect(owner).authorizeKey(user1.address, token1.target, 0, 3600))
         .to.be.revertedWithCustomError(paymaster, "InvalidAmount");
     });
 
     it("Should reject authorization with zero time window", async function () {
       const { paymaster, token1, owner, user1 } = await loadFixture(deployPaymasterFixture);
-      
+
       await expect(paymaster.connect(owner).authorizeKey(user1.address, token1.target, ethers.parseEther("100"), 0))
         .to.be.revertedWithCustomError(paymaster, "InvalidTimeWindow");
     });
 
     it("Should revoke a key", async function () {
       const { paymaster, token1, owner, user1 } = await loadFixture(deployPaymasterFixture);
-      
-      // First authorize
+
       await paymaster.connect(owner).authorizeKey(user1.address, token1.target, ethers.parseEther("100"), 3600);
-      
-      // Then revoke
+
       await expect(paymaster.connect(owner).revokeKey(user1.address, token1.target))
         .to.emit(paymaster, "KeyRevoked")
         .withArgs(user1.address, token1.target);
@@ -87,191 +90,295 @@ describe("RateLimitedPaymaster", function () {
 
     it("Should only allow owner to authorize keys", async function () {
       const { paymaster, token1, user1, user2 } = await loadFixture(deployPaymasterFixture);
-      
+
       await expect(paymaster.connect(user1).authorizeKey(user2.address, token1.target, ethers.parseEther("100"), 3600))
-        .to.be.revertedWith("Ownable: caller is not the owner");
+        .to.be.revertedWithCustomError(paymaster, "OwnableUnauthorizedAccount")
+        .withArgs(user1.address);
     });
   });
 
   describe("Payment Processing", function () {
-    it("Should process payment within limits", async function () {
-      const { paymaster, token1, owner, user1, spender } = await loadFixture(deployPaymasterFixture);
-      
+    it("Should process payment within limits and pay the key", async function () {
+      const { paymaster, token1, owner, user1 } = await loadFixture(deployPaymasterFixture);
+
       const amount = ethers.parseEther("100");
       const paymentAmount = ethers.parseEther("50");
-      
-      // Authorize key
+
       await paymaster.connect(owner).authorizeKey(user1.address, token1.target, amount, 3600);
-      
-      // Process payment
-      await expect(paymaster.connect(spender).processPayment(user1.address, token1.target, paymentAmount))
+
+      await expect(paymaster.connect(user1).processPayment(user1.address, token1.target, paymentAmount))
         .to.emit(paymaster, "PaymentProcessed")
-        .withArgs(user1.address, token1.target, paymentAmount, await time.latest() + 1);
+        .withArgs(user1.address, token1.target, paymentAmount, (await time.latest()) + 1);
 
-      // Check token transfer
-      expect(await token1.balanceOf(spender.address)).to.equal(paymentAmount);
+      expect(await token1.balanceOf(user1.address)).to.equal(paymentAmount);
     });
 
-    it("Should reject payment for unauthorized key", async function () {
-      const { paymaster, token1, user1, spender } = await loadFixture(deployPaymasterFixture);
-      
-      await expect(paymaster.connect(spender).processPayment(user1.address, token1.target, ethers.parseEther("50")))
-        .to.be.revertedWithCustomError(paymaster, "KeyNotAuthorized");
+    it("Should return true from a static call when payment is allowed", async function () {
+      const { paymaster, token1, owner, user1 } = await loadFixture(deployPaymasterFixture);
+      await paymaster.connect(owner).authorizeKey(user1.address, token1.target, ethers.parseEther("100"), 3600);
+      expect(
+        await paymaster.connect(user1).processPayment.staticCall(user1.address, token1.target, ethers.parseEther("1"))
+      ).to.be.true;
     });
 
-    it("Should reject payment exceeding spending limit", async function () {
+    it("Should revert when the caller is not the key", async function () {
       const { paymaster, token1, owner, user1, spender } = await loadFixture(deployPaymasterFixture);
-      
+
+      await paymaster.connect(owner).authorizeKey(user1.address, token1.target, ethers.parseEther("100"), 3600);
+
+      await expect(paymaster.connect(spender).processPayment(user1.address, token1.target, ethers.parseEther("50")))
+        .to.be.revertedWithCustomError(paymaster, "CallerNotKey");
+    });
+
+    it("Should deny (not revert) payment for unauthorized key", async function () {
+      const { paymaster, token1, user1 } = await loadFixture(deployPaymasterFixture);
+      const amount = ethers.parseEther("50");
+
+      expect(await paymaster.connect(user1).processPayment.staticCall(user1.address, token1.target, amount)).to.be.false;
+      await expect(paymaster.connect(user1).processPayment(user1.address, token1.target, amount))
+        .to.emit(paymaster, "PaymentDenied")
+        .withArgs(user1.address, token1.target, amount, "Key not authorized");
+      expect(await token1.balanceOf(user1.address)).to.equal(0);
+    });
+
+    it("Should deny payment exceeding spending limit", async function () {
+      const { paymaster, token1, owner, user1 } = await loadFixture(deployPaymasterFixture);
+
       const amount = ethers.parseEther("100");
       const paymentAmount = ethers.parseEther("150");
-      
-      // Authorize key
+
       await paymaster.connect(owner).authorizeKey(user1.address, token1.target, amount, 3600);
-      
-      // Process payment that exceeds limit
-      await expect(paymaster.connect(spender).processPayment(user1.address, token1.target, paymentAmount))
-        .to.be.revertedWithCustomError(paymaster, "SpendingLimitExceeded");
+
+      await expect(paymaster.connect(user1).processPayment(user1.address, token1.target, paymentAmount))
+        .to.emit(paymaster, "PaymentDenied")
+        .withArgs(user1.address, token1.target, paymentAmount, "Spending limit exceeded");
+      expect(await token1.balanceOf(user1.address)).to.equal(0);
     });
 
-    it("Should reject payment when paymaster has insufficient balance", async function () {
-      const { paymaster, token1, owner, user1, spender } = await loadFixture(deployPaymasterFixture);
-      
+    it("Should deny payment when paymaster has insufficient balance", async function () {
+      const { paymaster, token1, owner, user1 } = await loadFixture(deployPaymasterFixture);
+
       const amount = ethers.parseEther("20000"); // More than paymaster balance
-      
-      // Authorize key
+
       await paymaster.connect(owner).authorizeKey(user1.address, token1.target, amount, 3600);
-      
-      // Process payment
-      await expect(paymaster.connect(spender).processPayment(user1.address, token1.target, amount))
-        .to.be.revertedWithCustomError(paymaster, "InsufficientPaymasterBalance");
+
+      await expect(paymaster.connect(user1).processPayment(user1.address, token1.target, amount))
+        .to.emit(paymaster, "PaymentDenied")
+        .withArgs(user1.address, token1.target, amount, "Insufficient paymaster balance");
     });
 
     it("Should track multiple payments within time window", async function () {
-      const { paymaster, token1, owner, user1, spender } = await loadFixture(deployPaymasterFixture);
-      
+      const { paymaster, token1, owner, user1 } = await loadFixture(deployPaymasterFixture);
+
       const limit = ethers.parseEther("100");
       const payment1 = ethers.parseEther("30");
       const payment2 = ethers.parseEther("40");
-      const payment3 = ethers.parseEther("50"); // This should fail
-      
-      // Authorize key
+      const payment3 = ethers.parseEther("50"); // This should be denied
+
       await paymaster.connect(owner).authorizeKey(user1.address, token1.target, limit, 3600);
-      
-      // First payment
-      await paymaster.connect(spender).processPayment(user1.address, token1.target, payment1);
+
+      await paymaster.connect(user1).processPayment(user1.address, token1.target, payment1);
       expect(await paymaster.getCurrentSpending(user1.address, token1.target)).to.equal(payment1);
-      
-      // Second payment
-      await paymaster.connect(spender).processPayment(user1.address, token1.target, payment2);
+
+      await paymaster.connect(user1).processPayment(user1.address, token1.target, payment2);
       expect(await paymaster.getCurrentSpending(user1.address, token1.target)).to.equal(payment1 + payment2);
-      
-      // Third payment should fail
-      await expect(paymaster.connect(spender).processPayment(user1.address, token1.target, payment3))
-        .to.be.revertedWithCustomError(paymaster, "SpendingLimitExceeded");
+
+      await expect(paymaster.connect(user1).processPayment(user1.address, token1.target, payment3))
+        .to.emit(paymaster, "PaymentDenied")
+        .withArgs(user1.address, token1.target, payment3, "Spending limit exceeded");
+      expect(await paymaster.getCurrentSpending(user1.address, token1.target)).to.equal(payment1 + payment2);
     });
 
     it("Should allow payments after time window expires", async function () {
-      const { paymaster, token1, owner, user1, spender } = await loadFixture(deployPaymasterFixture);
-      
+      const { paymaster, token1, owner, user1 } = await loadFixture(deployPaymasterFixture);
+
       const limit = ethers.parseEther("100");
       const paymentAmount = ethers.parseEther("60");
       const timeWindow = 3600;
-      
-      // Authorize key
+
       await paymaster.connect(owner).authorizeKey(user1.address, token1.target, limit, timeWindow);
-      
-      // First payment
-      await paymaster.connect(spender).processPayment(user1.address, token1.target, paymentAmount);
-      
-      // Advance time beyond the window
+
+      await paymaster.connect(user1).processPayment(user1.address, token1.target, paymentAmount);
+
       await time.increase(timeWindow + 1);
-      
-      // Second payment should now be allowed
-      await paymaster.connect(spender).processPayment(user1.address, token1.target, paymentAmount);
+
+      await expect(paymaster.connect(user1).processPayment(user1.address, token1.target, paymentAmount))
+        .to.emit(paymaster, "PaymentProcessed");
       expect(await paymaster.getCurrentSpending(user1.address, token1.target)).to.equal(paymentAmount);
+      // Expired record was cleaned up
+      expect(await paymaster.getTransactionCount(user1.address)).to.equal(1);
+    });
+
+    it("Should keep per-token limits independent", async function () {
+      const { paymaster, token1, token2, owner, user1 } = await loadFixture(deployPaymasterFixture);
+
+      await paymaster.connect(owner).authorizeKey(user1.address, token1.target, ethers.parseEther("10"), 3600);
+      await paymaster.connect(owner).authorizeKey(user1.address, token2.target, ethers.parseEther("10"), 3600);
+
+      await paymaster.connect(user1).processPayment(user1.address, token1.target, ethers.parseEther("10"));
+      await expect(paymaster.connect(user1).processPayment(user1.address, token2.target, ethers.parseEther("10")))
+        .to.emit(paymaster, "PaymentProcessed");
+    });
+  });
+
+  describe("Pause", function () {
+    it("Should deny payments while paused and allow after unpause", async function () {
+      const { paymaster, token1, owner, user1 } = await loadFixture(deployPaymasterFixture);
+      const amount = ethers.parseEther("10");
+
+      await paymaster.connect(owner).authorizeKey(user1.address, token1.target, ethers.parseEther("100"), 3600);
+
+      await expect(paymaster.connect(owner).pause()).to.emit(paymaster, "PausedChanged").withArgs(true);
+      expect(await paymaster.paused()).to.be.true;
+
+      await expect(paymaster.connect(user1).processPayment(user1.address, token1.target, amount))
+        .to.emit(paymaster, "PaymentDenied")
+        .withArgs(user1.address, token1.target, amount, "Paymaster paused");
+
+      await expect(paymaster.connect(owner).unpause()).to.emit(paymaster, "PausedChanged").withArgs(false);
+
+      await expect(paymaster.connect(user1).processPayment(user1.address, token1.target, amount))
+        .to.emit(paymaster, "PaymentProcessed");
+    });
+
+    it("Should only allow owner to pause", async function () {
+      const { paymaster, user1 } = await loadFixture(deployPaymasterFixture);
+      await expect(paymaster.connect(user1).pause())
+        .to.be.revertedWithCustomError(paymaster, "OwnableUnauthorizedAccount");
     });
   });
 
   describe("View Functions", function () {
     it("Should return correct remaining spending capacity", async function () {
-      const { paymaster, token1, owner, user1, spender } = await loadFixture(deployPaymasterFixture);
-      
+      const { paymaster, token1, owner, user1 } = await loadFixture(deployPaymasterFixture);
+
       const limit = ethers.parseEther("100");
       const paymentAmount = ethers.parseEther("30");
-      
-      // Authorize key
+
       await paymaster.connect(owner).authorizeKey(user1.address, token1.target, limit, 3600);
-      
-      // Check initial capacity
+
       expect(await paymaster.getRemainingSpendingCapacity(user1.address, token1.target)).to.equal(limit);
-      
-      // Make payment
-      await paymaster.connect(spender).processPayment(user1.address, token1.target, paymentAmount);
-      
-      // Check remaining capacity
+
+      await paymaster.connect(user1).processPayment(user1.address, token1.target, paymentAmount);
+
       expect(await paymaster.getRemainingSpendingCapacity(user1.address, token1.target))
         .to.equal(limit - paymentAmount);
     });
 
-    it("Should return correct transaction count", async function () {
-      const { paymaster, token1, owner, user1, spender } = await loadFixture(deployPaymasterFixture);
-      
-      // Authorize key
+    it("Should return correct transaction count and records", async function () {
+      const { paymaster, token1, owner, user1 } = await loadFixture(deployPaymasterFixture);
+
       await paymaster.connect(owner).authorizeKey(user1.address, token1.target, ethers.parseEther("100"), 3600);
-      
-      // Initial count should be 0
+
       expect(await paymaster.getTransactionCount(user1.address)).to.equal(0);
-      
-      // Make a payment
-      await paymaster.connect(spender).processPayment(user1.address, token1.target, ethers.parseEther("30"));
-      
-      // Count should be 1
+      expect(await paymaster.getKeyTransactions(user1.address)).to.deep.equal([]);
+
+      const amount = ethers.parseEther("30");
+      await paymaster.connect(user1).processPayment(user1.address, token1.target, amount);
+
       expect(await paymaster.getTransactionCount(user1.address)).to.equal(1);
+      const records = await paymaster.getKeyTransactions(user1.address);
+      expect(records.length).to.equal(1);
+      expect(records[0].amount).to.equal(amount);
+      expect(records[0].token).to.equal(token1.target);
+      expect(records[0].timestamp).to.equal(await time.latest());
+    });
+
+    it("checkPayment should mirror processPayment decisions", async function () {
+      const { paymaster, token1, owner, user1 } = await loadFixture(deployPaymasterFixture);
+      const ten = ethers.parseEther("10");
+
+      let [ok, reason] = await paymaster.checkPayment(user1.address, token1.target, ten);
+      expect(ok).to.be.false;
+      expect(reason).to.equal("Key not authorized");
+
+      await paymaster.connect(owner).authorizeKey(user1.address, token1.target, ten, 3600);
+      [ok, reason] = await paymaster.checkPayment(user1.address, token1.target, ten);
+      expect(ok).to.be.true;
+      expect(reason).to.equal("");
+
+      await paymaster.connect(user1).processPayment(user1.address, token1.target, ten);
+      [ok, reason] = await paymaster.checkPayment(user1.address, token1.target, 1n);
+      expect(ok).to.be.false;
+      expect(reason).to.equal("Spending limit exceeded");
+
+      await paymaster.connect(owner).pause();
+      [ok, reason] = await paymaster.checkPayment(user1.address, token1.target, 1n);
+      expect(reason).to.equal("Paymaster paused");
+
+      await paymaster.connect(owner).unpause();
+      [ok, reason] = await paymaster.checkPayment(user1.address, token1.target, ethers.parseEther("20000"));
+      expect(reason).to.equal("Insufficient paymaster balance");
     });
   });
 
   describe("Token Management", function () {
     it("Should allow owner to withdraw tokens", async function () {
       const { paymaster, token1, owner } = await loadFixture(deployPaymasterFixture);
-      
+
       const withdrawAmount = ethers.parseEther("1000");
       const initialBalance = await token1.balanceOf(owner.address);
-      
+
       await paymaster.connect(owner).withdrawToken(token1.target, withdrawAmount);
-      
+
       expect(await token1.balanceOf(owner.address)).to.equal(initialBalance + withdrawAmount);
       expect(await token1.balanceOf(paymaster.target)).to.equal(ethers.parseEther("9000"));
     });
 
     it("Should allow deposits", async function () {
       const { paymaster, token1, owner } = await loadFixture(deployPaymasterFixture);
-      
+
       const depositAmount = ethers.parseEther("500");
-      
-      // Approve and deposit
+
       await token1.connect(owner).approve(paymaster.target, depositAmount);
       await paymaster.connect(owner).depositToken(token1.target, depositAmount);
-      
+
       expect(await token1.balanceOf(paymaster.target)).to.equal(ethers.parseEther("10500"));
     });
 
     it("Should only allow owner to withdraw", async function () {
       const { paymaster, token1, user1 } = await loadFixture(deployPaymasterFixture);
-      
+
       await expect(paymaster.connect(user1).withdrawToken(token1.target, ethers.parseEther("100")))
-        .to.be.revertedWith("Ownable: caller is not the owner");
+        .to.be.revertedWithCustomError(paymaster, "OwnableUnauthorizedAccount");
     });
   });
 
   describe("Upgrades", function () {
     it("Should be upgradeable by owner", async function () {
-      const { paymaster, owner } = await loadFixture(deployPaymasterFixture);
-      
+      const { paymaster } = await loadFixture(deployPaymasterFixture);
+
       const RateLimitedPaymasterV2 = await ethers.getContractFactory("RateLimitedPaymaster");
-      
-      // This should not revert if the owner is calling it
+
       await expect(upgrades.upgradeProxy(paymaster.target, RateLimitedPaymasterV2))
         .to.not.be.reverted;
+    });
+
+    it("Should reject upgrades from non-owners", async function () {
+      const { paymaster, user1 } = await loadFixture(deployPaymasterFixture);
+      const Impl = await ethers.getContractFactory("RateLimitedPaymaster");
+      const impl = await Impl.deploy();
+      await expect(paymaster.connect(user1).upgradeToAndCall(impl.target, "0x"))
+        .to.be.revertedWithCustomError(paymaster, "OwnableUnauthorizedAccount");
+    });
+  });
+
+  describe("Manual proxy deployment (what the web UI does)", function () {
+    it("Should work with a bare ERC1967Proxy + initialize calldata", async function () {
+      const [owner, user1] = await ethers.getSigners();
+      const Impl = await ethers.getContractFactory("RateLimitedPaymaster");
+      const impl = await Impl.deploy();
+      const initData = Impl.interface.encodeFunctionData("initialize", [owner.address]);
+      const Proxy = await ethers.getContractFactory("ERC1967Proxy");
+      const proxy = await Proxy.deploy(impl.target, initData);
+      const paymaster = Impl.attach(proxy.target);
+
+      expect(await paymaster.owner()).to.equal(owner.address);
+      await expect(paymaster.connect(user1).pause())
+        .to.be.revertedWithCustomError(paymaster, "OwnableUnauthorizedAccount");
+      // Implementation cannot be re-initialized
+      await expect(paymaster.initialize(user1.address))
+        .to.be.revertedWithCustomError(paymaster, "InvalidInitialization");
     });
   });
 });

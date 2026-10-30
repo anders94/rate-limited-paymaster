@@ -9,7 +9,7 @@ const ALCHEMY_API_KEY = process.env.ALCHEMY_API_KEY || "";
 /** @type import('hardhat/config').HardhatUserConfig */
 module.exports = {
   solidity: {
-    version: "0.8.19",
+    version: "0.8.22",
     settings: {
       optimizer: {
         enabled: true,
@@ -29,6 +29,11 @@ module.exports = {
       url: `https://eth-sepolia.g.alchemy.com/v2/${ALCHEMY_API_KEY}`,
       accounts: [PRIVATE_KEY],
       chainId: 11155111,
+    },
+    radiusTestnet: {
+      url: "https://rpc.testnet.radiustech.xyz",
+      accounts: [PRIVATE_KEY],
+      chainId: 72344,
     },
     mainnet: {
       url: `https://eth-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}`,

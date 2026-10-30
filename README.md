@@ -8,6 +8,8 @@ A smart contract paymaster that enforces spending limits on ERC-20 tokens over s
 - **Multi-Token Support**: Support for any ERC-20 token with individual limits per token
 - **Key Management**: Admin can authorize/revoke keys with custom spending limits
 - **Automatic Cleanup**: Efficiently removes expired transaction records to optimize gas costs
+- **Pausable**: Owner can pause all spending with one transaction
+- **Observable Denials**: Denied requests emit `PaymentDenied` on-chain instead of reverting
 - **Upgradeable**: Uses OpenZeppelin's UUPS proxy pattern for future upgrades
 - **Comprehensive Testing**: Full test suite with edge case coverage
 
@@ -19,8 +21,8 @@ A smart contract paymaster that enforces spending limits on ERC-20 tokens over s
    - Checks the amount and time constraints set by the administrator  
    - Reviews historical transactions within the time window
    - Calculates total amount spent within that time
-   - Denies transaction if it would exceed the spending limit
-   - Allows transaction if within limits and paymaster has sufficient balance
+   - Denies the request (emits `PaymentDenied`, returns `false`) if it would exceed the spending limit
+   - Allows the request if within limits and paymaster has sufficient balance
 3. **Storage Management**: Transaction records are automatically cleaned up when they fall outside the time window
 
 ## Installation
@@ -71,8 +73,11 @@ npm run deploy
 ### Deploy to Testnet
 
 ```bash
-npm run deploy:testnet
+npm run deploy:testnet   # Sepolia
+npm run deploy:radius    # Radius testnet (chain 72344)
 ```
+
+A browser-based deployer and admin UI lives in the sibling `rate-limited-paymaster-frontend` repo.
 
 ### Verify Contract
 
@@ -101,14 +106,22 @@ Revokes authorization for a key to spend a specific token.
 **Access:** Owner only
 
 #### `processPayment(address key, address token, uint256 amount)`
-Processes a payment request, checking spending limits and transferring tokens if approved.
+Processes a payment request for `key`. The caller **must be `key`**. Checks the pause flag, authorization, paymaster balance and the rolling spending limit, then transfers `amount` of `token` to the caller.
 
-**Returns:** `bool` - Success status
+**Returns:** `bool` - `true` if the payment was made. Denials **do not revert**: the function emits `PaymentDenied(key, token, amount, reason)` and returns `false`, so denials are observable on-chain. Callers must check the return value.
+
+**Denial reasons:** `"Paymaster paused"`, `"Key not authorized"`, `"Insufficient paymaster balance"`, `"Spending limit exceeded"`.
 
 **Reverts:**
-- `KeyNotAuthorized` - If the key is not authorized for the token
-- `SpendingLimitExceeded` - If payment would exceed the spending limit
-- `InsufficientPaymasterBalance` - If paymaster doesn't have enough tokens
+- `CallerNotKey` - If `msg.sender != key`
+
+#### `checkPayment(address key, address token, uint256 amount)`
+View-only preflight. Returns `(bool ok, string reason)` using the same rules as `processPayment`.
+
+#### `pause()` / `unpause()`
+While paused every payment request is denied with reason `"Paymaster paused"`. Emits `PausedChanged(bool)`.
+
+**Access:** Owner only
 
 ### View Functions
 
@@ -123,6 +136,9 @@ Returns the remaining spending capacity for a key-token pair.
 
 #### `getTransactionCount(address key)`
 Returns the number of tracked transactions for a key.
+
+#### `getKeyTransactions(address key)`
+Returns the tracked `(amount, timestamp, token)` records for a key. Records older than the key's time window are removed on the next successful `processPayment`.
 
 ### Token Management
 
@@ -165,14 +181,16 @@ async function example() {
     3600 // 1 hour in seconds
   );
 
-  // Process a payment
-  await paymaster.processPayment(
+  // Process a payment (the key itself must be the caller)
+  const tx = await paymaster.connect(authorizedKey).processPayment(
     authorizedKey.address,
     token.target,
     ethers.parseEther("50") // 50 tokens
   );
-
-  console.log("Payment processed successfully!");
+  const receipt = await tx.wait();
+  // Denials emit PaymentDenied and return false instead of reverting
+  const denied = receipt.logs.some((l) => l.fragment?.name === "PaymentDenied");
+  console.log(denied ? "Payment denied" : "Payment processed successfully!");
 }
 ```
 
