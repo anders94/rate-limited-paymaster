@@ -8,6 +8,8 @@ A smart contract paymaster that enforces spending limits on ERC-20 tokens over s
 - **Multi-Token Support**: Support for any ERC-20 token with individual limits per token
 - **Key Management**: Admin can authorize/revoke keys with custom spending limits
 - **Automatic Cleanup**: Efficiently removes expired transaction records to optimize gas costs
+- **Gasless, ephemeral clients**: keys sign EIP-712 payment requests off-chain; anyone (a relayer) submits them, singly or in batches, and pays the gas. The payment goes to the recipient named in the request, so a client key never needs funds or tokens.
+- **Self-service enrollment**: the owner sets a per-token policy and grants an authorizer (relayer) the right to enroll new keys with it
 - **Pausable**: Owner can pause all spending with one transaction
 - **Observable Denials**: Denied requests emit `PaymentDenied` on-chain instead of reverting
 - **Upgradeable**: Uses OpenZeppelin's UUPS proxy pattern for future upgrades
@@ -114,6 +116,23 @@ Processes a payment request for `key`. The caller **must be `key`**. Checks the 
 
 **Reverts:**
 - `CallerNotKey` - If `msg.sender != key`
+
+#### `processSignedPayment(PaymentRequest req, bytes signature)` / `processSignedPayments(PaymentRequest[] reqs, bytes[] signatures)`
+Submit requests signed by their keys (EIP-712, domain `RateLimitedPaymaster` v`1`). Anyone may call; the caller pays gas. Per item, in order: an invalid signature, an expired `deadline` or a wrong `nonce` is denied without touching the nonce; otherwise the nonce is consumed (`nonces[key]++`) and the same checks as `processPayment` run, paying `req.to` on success. Nothing reverts per item, so a batch transaction carries one `PaymentProcessed`/`PaymentDenied` per request.
+
+```
+struct PaymentRequest { address key; address token; address to; uint256 amount; uint256 nonce; uint256 deadline; }
+```
+
+**Additional denial reasons:** `"Invalid signature"`, `"Request expired"`, `"Bad nonce"`.
+
+`hashPaymentRequest(req)` returns the digest a key must sign; `nonces(key)` returns the next expected nonce. A denied request consumes its nonce, so a client must sign a fresh request to retry.
+
+#### `enrollKey(address key, address token)` / `enrollKeys(address[] keys, address token)`
+Authorize keys with the token's enrollment policy. Callable by the owner or any **authorizer**. Reverts with `EnrollmentDisabled` if the policy is off and `AlreadyAuthorized` if the pair is active (use `authorizeKey` to change an active limit).
+
+#### `setAuthorizer(address authorizer, bool allowed)` / `setEnrollmentPolicy(address token, uint256 amount, uint256 timeWindow, bool enabled)`
+Owner only. Emit `AuthorizerChanged` and `EnrollmentPolicyChanged`. `getEnrollmentPolicy(token)` reads the policy.
 
 #### `checkPayment(address key, address token, uint256 amount)`
 View-only preflight. Returns `(bool ok, string reason)` using the same rules as `processPayment`.

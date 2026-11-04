@@ -9,8 +9,10 @@ const ALCHEMY_API_KEY = process.env.ALCHEMY_API_KEY || "";
 /** @type import('hardhat/config').HardhatUserConfig */
 module.exports = {
   solidity: {
-    version: "0.8.22",
+    version: "0.8.28",
     settings: {
+      // OpenZeppelin 5.6 uses mcopy (Cancun). Anvil and Radius (Osaka) support it.
+      evmVersion: "cancun",
       optimizer: {
         enabled: true,
         runs: 200,

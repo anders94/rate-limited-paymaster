@@ -106,9 +106,11 @@ describe("RateLimitedPaymaster", function () {
 
       await paymaster.connect(owner).authorizeKey(user1.address, token1.target, amount, 3600);
 
+      const next = (await time.latest()) + 5;
+      await time.setNextBlockTimestamp(next);
       await expect(paymaster.connect(user1).processPayment(user1.address, token1.target, paymentAmount))
         .to.emit(paymaster, "PaymentProcessed")
-        .withArgs(user1.address, token1.target, paymentAmount, (await time.latest()) + 1);
+        .withArgs(user1.address, token1.target, paymentAmount, next);
 
       expect(await token1.balanceOf(user1.address)).to.equal(paymentAmount);
     });
@@ -379,6 +381,259 @@ describe("RateLimitedPaymaster", function () {
       // Implementation cannot be re-initialized
       await expect(paymaster.initialize(user1.address))
         .to.be.revertedWithCustomError(paymaster, "InvalidInitialization");
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Signed requests (relayer path) and enrollment
+  // -------------------------------------------------------------------------
+
+  async function signRequest(signer, paymaster, req) {
+    const { chainId } = await ethers.provider.getNetwork();
+    const domain = { name: "RateLimitedPaymaster", version: "1", chainId, verifyingContract: await paymaster.getAddress() };
+    const types = {
+      PaymentRequest: [
+        { name: "key", type: "address" },
+        { name: "token", type: "address" },
+        { name: "to", type: "address" },
+        { name: "amount", type: "uint256" },
+        { name: "nonce", type: "uint256" },
+        { name: "deadline", type: "uint256" },
+      ],
+    };
+    return signer.signTypedData(domain, types, req);
+  }
+
+  async function makeReq(paymaster, key, token, to, amount, overrides = {}) {
+    return {
+      key: key.address,
+      token: token.target,
+      to,
+      amount,
+      nonce: await paymaster.nonces(key.address),
+      deadline: (await time.latest()) + 600,
+      ...overrides,
+    };
+  }
+
+  describe("Signed payments", function () {
+    it("Should pay the recipient from a request signed by the key, submitted by a relayer", async function () {
+      const { paymaster, token1, owner, user1, user2, spender } = await loadFixture(deployPaymasterFixture);
+      await paymaster.connect(owner).authorizeKey(user1.address, token1.target, ethers.parseEther("100"), 3600);
+      const amount = ethers.parseEther("25");
+      const req = await makeReq(paymaster, user1, token1, user2.address, amount);
+      const sig = await signRequest(user1, paymaster, req);
+
+      expect(await paymaster.connect(spender).processSignedPayment.staticCall(req, sig)).to.be.true;
+      const next = (await time.latest()) + 5;
+      await time.setNextBlockTimestamp(next);
+      await expect(paymaster.connect(spender).processSignedPayment(req, sig))
+        .to.emit(paymaster, "PaymentProcessed")
+        .withArgs(user1.address, token1.target, amount, next);
+
+      expect(await token1.balanceOf(user2.address)).to.equal(amount);
+      expect(await token1.balanceOf(user1.address)).to.equal(0);
+      expect(await token1.balanceOf(spender.address)).to.equal(0);
+      expect(await paymaster.nonces(user1.address)).to.equal(1);
+      expect(await paymaster.getCurrentSpending(user1.address, token1.target)).to.equal(amount);
+    });
+
+    it("Should deny a request signed by someone other than the key and leave the nonce untouched", async function () {
+      const { paymaster, token1, owner, user1, user2, spender } = await loadFixture(deployPaymasterFixture);
+      await paymaster.connect(owner).authorizeKey(user1.address, token1.target, ethers.parseEther("100"), 3600);
+      const req = await makeReq(paymaster, user1, token1, user2.address, ethers.parseEther("1"));
+      const sig = await signRequest(user2, paymaster, req);
+      await expect(paymaster.connect(spender).processSignedPayment(req, sig))
+        .to.emit(paymaster, "PaymentDenied")
+        .withArgs(user1.address, token1.target, ethers.parseEther("1"), "Invalid signature");
+      expect(await paymaster.nonces(user1.address)).to.equal(0);
+    });
+
+    it("Should deny a malformed signature without reverting", async function () {
+      const { paymaster, token1, owner, user1, user2, spender } = await loadFixture(deployPaymasterFixture);
+      await paymaster.connect(owner).authorizeKey(user1.address, token1.target, ethers.parseEther("100"), 3600);
+      const req = await makeReq(paymaster, user1, token1, user2.address, 1n);
+      await expect(paymaster.connect(spender).processSignedPayment(req, "0x1234"))
+        .to.emit(paymaster, "PaymentDenied")
+        .withArgs(user1.address, token1.target, 1n, "Invalid signature");
+    });
+
+    it("Should deny an expired request and leave the nonce untouched", async function () {
+      const { paymaster, token1, owner, user1, user2, spender } = await loadFixture(deployPaymasterFixture);
+      await paymaster.connect(owner).authorizeKey(user1.address, token1.target, ethers.parseEther("100"), 3600);
+      const req = await makeReq(paymaster, user1, token1, user2.address, 1n, { deadline: (await time.latest()) - 1 });
+      const sig = await signRequest(user1, paymaster, req);
+      await expect(paymaster.connect(spender).processSignedPayment(req, sig))
+        .to.emit(paymaster, "PaymentDenied")
+        .withArgs(user1.address, token1.target, 1n, "Request expired");
+      expect(await paymaster.nonces(user1.address)).to.equal(0);
+    });
+
+    it("Should deny a wrong nonce and reject a replay", async function () {
+      const { paymaster, token1, owner, user1, user2, spender } = await loadFixture(deployPaymasterFixture);
+      await paymaster.connect(owner).authorizeKey(user1.address, token1.target, ethers.parseEther("100"), 3600);
+      const bad = await makeReq(paymaster, user1, token1, user2.address, 1n, { nonce: 5 });
+      await expect(paymaster.connect(spender).processSignedPayment(bad, await signRequest(user1, paymaster, bad)))
+        .to.emit(paymaster, "PaymentDenied")
+        .withArgs(user1.address, token1.target, 1n, "Bad nonce");
+
+      const good = await makeReq(paymaster, user1, token1, user2.address, 1n);
+      const sig = await signRequest(user1, paymaster, good);
+      await expect(paymaster.connect(spender).processSignedPayment(good, sig)).to.emit(paymaster, "PaymentProcessed");
+      // Replay of the same signed request
+      await expect(paymaster.connect(spender).processSignedPayment(good, sig))
+        .to.emit(paymaster, "PaymentDenied")
+        .withArgs(user1.address, token1.target, 1n, "Bad nonce");
+      expect(await token1.balanceOf(user2.address)).to.equal(1n);
+    });
+
+    it("Should consume the nonce when a well-formed request is denied for the limit", async function () {
+      const { paymaster, token1, owner, user1, user2, spender } = await loadFixture(deployPaymasterFixture);
+      await paymaster.connect(owner).authorizeKey(user1.address, token1.target, ethers.parseEther("10"), 3600);
+      const req = await makeReq(paymaster, user1, token1, user2.address, ethers.parseEther("11"));
+      await expect(paymaster.connect(spender).processSignedPayment(req, await signRequest(user1, paymaster, req)))
+        .to.emit(paymaster, "PaymentDenied")
+        .withArgs(user1.address, token1.target, ethers.parseEther("11"), "Spending limit exceeded");
+      expect(await paymaster.nonces(user1.address)).to.equal(1);
+    });
+
+    it("Should process a batch from one key in order: 3 paid then 2 denied", async function () {
+      const { paymaster, token1, owner, user1, user2, spender } = await loadFixture(deployPaymasterFixture);
+      await paymaster.connect(owner).authorizeKey(user1.address, token1.target, ethers.parseEther("10"), 60);
+      const three = ethers.parseEther("3");
+      const reqs = [];
+      const sigs = [];
+      for (let n = 0; n < 5; n++) {
+        const r = await makeReq(paymaster, user1, token1, user2.address, three, { nonce: n });
+        reqs.push(r);
+        sigs.push(await signRequest(user1, paymaster, r));
+      }
+      const results = await paymaster.connect(spender).processSignedPayments.staticCall(reqs, sigs);
+      expect(results).to.deep.equal([true, true, true, false, false]);
+
+      const tx = await paymaster.connect(spender).processSignedPayments(reqs, sigs);
+      const receipt = await tx.wait();
+      const names = receipt.logs.map((l) => { try { return paymaster.interface.parseLog(l)?.name; } catch { return undefined; } }).filter(Boolean);
+      expect(names).to.deep.equal(["PaymentProcessed", "PaymentProcessed", "PaymentProcessed", "PaymentDenied", "PaymentDenied"]);
+      expect(await token1.balanceOf(user2.address)).to.equal(three * 3n);
+      expect(await paymaster.nonces(user1.address)).to.equal(5);
+      expect(await paymaster.getRemainingSpendingCapacity(user1.address, token1.target)).to.equal(ethers.parseEther("1"));
+    });
+
+    it("Should process a batch across several keys with independent limits", async function () {
+      const { paymaster, token1, owner, user1, user2, spender } = await loadFixture(deployPaymasterFixture);
+      await paymaster.connect(owner).authorizeKey(user1.address, token1.target, ethers.parseEther("5"), 60);
+      await paymaster.connect(owner).authorizeKey(user2.address, token1.target, ethers.parseEther("5"), 60);
+      const r1 = await makeReq(paymaster, user1, token1, spender.address, ethers.parseEther("5"));
+      const r2 = await makeReq(paymaster, user2, token1, spender.address, ethers.parseEther("5"));
+      const r3 = await makeReq(paymaster, user1, token1, spender.address, ethers.parseEther("1"), { nonce: 1 });
+      const sigs = [await signRequest(user1, paymaster, r1), await signRequest(user2, paymaster, r2), await signRequest(user1, paymaster, r3)];
+      const results = await paymaster.connect(spender).processSignedPayments.staticCall([r1, r2, r3], sigs);
+      expect(results).to.deep.equal([true, true, false]);
+      await paymaster.connect(spender).processSignedPayments([r1, r2, r3], sigs);
+      expect(await token1.balanceOf(spender.address)).to.equal(ethers.parseEther("10"));
+    });
+
+    it("Should revert a batch with mismatched array lengths", async function () {
+      const { paymaster, token1, user1, user2, spender } = await loadFixture(deployPaymasterFixture);
+      const r = await makeReq(paymaster, user1, token1, user2.address, 1n);
+      await expect(paymaster.connect(spender).processSignedPayments([r], [])).to.be.revertedWithCustomError(paymaster, "LengthMismatch");
+    });
+
+    it("Should expose the EIP-712 digest used for signing", async function () {
+      const { paymaster, token1, user1, user2 } = await loadFixture(deployPaymasterFixture);
+      const req = await makeReq(paymaster, user1, token1, user2.address, 7n);
+      const { chainId } = await ethers.provider.getNetwork();
+      const domain = { name: "RateLimitedPaymaster", version: "1", chainId, verifyingContract: paymaster.target };
+      const types = { PaymentRequest: [
+        { name: "key", type: "address" }, { name: "token", type: "address" }, { name: "to", type: "address" },
+        { name: "amount", type: "uint256" }, { name: "nonce", type: "uint256" }, { name: "deadline", type: "uint256" } ] };
+      expect(await paymaster.hashPaymentRequest(req)).to.equal(ethers.TypedDataEncoder.hash(domain, types, req));
+    });
+  });
+
+  describe("Enrollment", function () {
+    it("Should let an authorizer enroll keys under the owner's policy", async function () {
+      const { paymaster, token1, owner, user1, spender } = await loadFixture(deployPaymasterFixture);
+      await expect(paymaster.connect(owner).setAuthorizer(spender.address, true))
+        .to.emit(paymaster, "AuthorizerChanged").withArgs(spender.address, true);
+      await expect(paymaster.connect(owner).setEnrollmentPolicy(token1.target, ethers.parseEther("10"), 60, true))
+        .to.emit(paymaster, "EnrollmentPolicyChanged").withArgs(token1.target, ethers.parseEther("10"), 60, true);
+
+      await expect(paymaster.connect(spender).enrollKey(user1.address, token1.target))
+        .to.emit(paymaster, "KeyAuthorized").withArgs(user1.address, token1.target, ethers.parseEther("10"), 60);
+      const limit = await paymaster.getSpendingLimit(user1.address, token1.target);
+      expect(limit.isActive).to.be.true;
+      expect(limit.amount).to.equal(ethers.parseEther("10"));
+      const policy = await paymaster.getEnrollmentPolicy(token1.target);
+      expect(policy.enabled).to.be.true;
+    });
+
+    it("Should reject enrollment from strangers, when disabled, or when already active", async function () {
+      const { paymaster, token1, owner, user1, user2, spender } = await loadFixture(deployPaymasterFixture);
+      await expect(paymaster.connect(user2).enrollKey(user1.address, token1.target))
+        .to.be.revertedWithCustomError(paymaster, "NotAuthorizer");
+
+      await paymaster.connect(owner).setAuthorizer(spender.address, true);
+      await expect(paymaster.connect(spender).enrollKey(user1.address, token1.target))
+        .to.be.revertedWithCustomError(paymaster, "EnrollmentDisabled");
+
+      await paymaster.connect(owner).setEnrollmentPolicy(token1.target, ethers.parseEther("10"), 60, true);
+      await paymaster.connect(spender).enrollKey(user1.address, token1.target);
+      await expect(paymaster.connect(spender).enrollKey(user1.address, token1.target))
+        .to.be.revertedWithCustomError(paymaster, "AlreadyAuthorized");
+
+      // Owner can override an enrolled key's limit, and revoke lets it be re-enrolled
+      await paymaster.connect(owner).authorizeKey(user1.address, token1.target, ethers.parseEther("50"), 120);
+      expect((await paymaster.getSpendingLimit(user1.address, token1.target)).amount).to.equal(ethers.parseEther("50"));
+      await paymaster.connect(owner).revokeKey(user1.address, token1.target);
+      await expect(paymaster.connect(spender).enrollKey(user1.address, token1.target)).to.emit(paymaster, "KeyAuthorized");
+
+      // Owner may enroll directly too; removing the authorizer stops the relayer
+      await paymaster.connect(owner).setEnrollmentPolicy(token1.target, ethers.parseEther("10"), 60, true);
+      await paymaster.connect(owner).setAuthorizer(spender.address, false);
+      await expect(paymaster.connect(spender).enrollKey(user2.address, token1.target))
+        .to.be.revertedWithCustomError(paymaster, "NotAuthorizer");
+      await expect(paymaster.connect(owner).enrollKey(user2.address, token1.target)).to.emit(paymaster, "KeyAuthorized");
+    });
+
+    it("Should enroll many keys in one transaction", async function () {
+      const { paymaster, token1, owner, spender } = await loadFixture(deployPaymasterFixture);
+      await paymaster.connect(owner).setAuthorizer(spender.address, true);
+      await paymaster.connect(owner).setEnrollmentPolicy(token1.target, ethers.parseEther("10"), 60, true);
+      const keys = Array.from({ length: 5 }, () => ethers.Wallet.createRandom().address);
+      const tx = await paymaster.connect(spender).enrollKeys(keys, token1.target);
+      const receipt = await tx.wait();
+      expect(receipt.logs.filter((l) => { try { return paymaster.interface.parseLog(l)?.name === "KeyAuthorized"; } catch { return false; } }).length).to.equal(5);
+      for (const k of keys) expect((await paymaster.getSpendingLimit(k, token1.target)).isActive).to.be.true;
+      // One duplicate makes the whole batch revert (the relayer de-duplicates before sending)
+      await expect(paymaster.connect(spender).enrollKeys([keys[0]], token1.target)).to.be.revertedWithCustomError(paymaster, "AlreadyAuthorized");
+    });
+
+    it("Should reject an enabled policy with zero amount or window, and only owner may set it", async function () {
+      const { paymaster, token1, owner, user1 } = await loadFixture(deployPaymasterFixture);
+      await expect(paymaster.connect(owner).setEnrollmentPolicy(token1.target, 0, 60, true)).to.be.revertedWithCustomError(paymaster, "InvalidAmount");
+      await expect(paymaster.connect(owner).setEnrollmentPolicy(token1.target, 1, 0, true)).to.be.revertedWithCustomError(paymaster, "InvalidTimeWindow");
+      await expect(paymaster.connect(user1).setEnrollmentPolicy(token1.target, 1, 1, true)).to.be.revertedWithCustomError(paymaster, "OwnableUnauthorizedAccount");
+      await expect(paymaster.connect(user1).setAuthorizer(user1.address, true)).to.be.revertedWithCustomError(paymaster, "OwnableUnauthorizedAccount");
+      // Disabling with zeros is fine
+      await paymaster.connect(owner).setEnrollmentPolicy(token1.target, 0, 0, false);
+    });
+
+    it("End to end: enrolled ephemeral key, relayed signed payment, key never holds anything", async function () {
+      const { paymaster, token1, owner, spender } = await loadFixture(deployPaymasterFixture);
+      const ephemeral = ethers.Wallet.createRandom().connect(ethers.provider); // never funded
+      const merchant = ethers.Wallet.createRandom();
+      await paymaster.connect(owner).setAuthorizer(spender.address, true);
+      await paymaster.connect(owner).setEnrollmentPolicy(token1.target, ethers.parseEther("10"), 60, true);
+      await paymaster.connect(spender).enrollKey(ephemeral.address, token1.target);
+
+      const req = await makeReq(paymaster, ephemeral, token1, merchant.address, ethers.parseEther("4"));
+      const sig = await signRequest(ephemeral, paymaster, req);
+      await expect(paymaster.connect(spender).processSignedPayment(req, sig)).to.emit(paymaster, "PaymentProcessed");
+      expect(await token1.balanceOf(merchant.address)).to.equal(ethers.parseEther("4"));
+      expect(await ethers.provider.getBalance(ephemeral.address)).to.equal(0);
+      expect(await token1.balanceOf(ephemeral.address)).to.equal(0);
     });
   });
 });
