@@ -104,6 +104,12 @@ contract RateLimitedPaymaster is Initializable, OwnableUpgradeable, UUPSUpgradea
         __EIP712_init("RateLimitedPaymaster", "1");
     }
 
+    /// @notice Upgrade hook for proxies deployed before signed requests existed:
+    ///         sets the EIP-712 domain. Call via upgradeToAndCall. Runs once.
+    function initializeV2() public reinitializer(2) {
+        __EIP712_init("RateLimitedPaymaster", "1");
+    }
+
     // ---------------------------------------------------------------------
     // Admin
     // ---------------------------------------------------------------------

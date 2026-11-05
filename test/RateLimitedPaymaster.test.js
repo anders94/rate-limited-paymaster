@@ -356,6 +356,31 @@ describe("RateLimitedPaymaster", function () {
         .to.not.be.reverted;
     });
 
+    it("Should let initializeV2 run exactly once (upgrade path for legacy proxies)", async function () {
+      const { paymaster, token1, owner, user1, user2, spender } = await loadFixture(deployPaymasterFixture);
+      await paymaster.connect(owner).initializeV2();
+      await expect(paymaster.initializeV2()).to.be.revertedWithCustomError(paymaster, "InvalidInitialization");
+      // Domain still verifies signed requests
+      await paymaster.connect(owner).authorizeKey(user1.address, token1.target, ethers.parseEther("10"), 60);
+      const req = await makeReq(paymaster, user1, token1, user2.address, 1n);
+      await expect(paymaster.connect(spender).processSignedPayment(req, await signRequest(user1, paymaster, req))).to.emit(paymaster, "PaymentProcessed");
+    });
+
+    it("Should upgrade a proxy to a new implementation with upgradeToAndCall(initializeV2)", async function () {
+      const [owner, user1] = await ethers.getSigners();
+      const Impl = await ethers.getContractFactory("RateLimitedPaymaster");
+      const implV1 = await Impl.deploy();
+      const Proxy = await ethers.getContractFactory("ERC1967Proxy");
+      const proxy = await Proxy.deploy(implV1.target, Impl.interface.encodeFunctionData("initialize", [owner.address]));
+      const pm = Impl.attach(proxy.target);
+      const implV2 = await Impl.deploy();
+      const data = Impl.interface.encodeFunctionData("initializeV2", []);
+      await expect(pm.connect(user1).upgradeToAndCall(implV2.target, data)).to.be.revertedWithCustomError(pm, "OwnableUnauthorizedAccount");
+      // initializeV2 on a proxy still at version 1 is fine; on this fresh proxy initialize() already set v1
+      await expect(pm.connect(owner).upgradeToAndCall(implV2.target, data)).to.emit(pm, "Upgraded").withArgs(implV2.target);
+      expect(await pm.owner()).to.equal(owner.address);
+    });
+
     it("Should reject upgrades from non-owners", async function () {
       const { paymaster, user1 } = await loadFixture(deployPaymasterFixture);
       const Impl = await ethers.getContractFactory("RateLimitedPaymaster");
