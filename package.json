@@ -9,6 +9,7 @@
     "deploy": "hardhat run scripts/deploy.js",
     "deploy:testnet": "hardhat run scripts/deploy.js --network sepolia",
     "deploy:radius": "hardhat run scripts/deploy.js --network radiusTestnet",
+    "upgrade:radius": "hardhat run scripts/upgrade.js --network radiusTestnet",
     "verify": "hardhat verify",
     "coverage": "hardhat coverage",
     "node": "hardhat node",

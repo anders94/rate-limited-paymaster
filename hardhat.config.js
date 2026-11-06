@@ -27,6 +27,11 @@ module.exports = {
       url: "http://127.0.0.1:8545",
       chainId: 1337,
     },
+    anvil: {
+      url: "http://127.0.0.1:8545",
+      chainId: 31337,
+      accounts: [PRIVATE_KEY],
+    },
     sepolia: {
       url: `https://eth-sepolia.g.alchemy.com/v2/${ALCHEMY_API_KEY}`,
       accounts: [PRIVATE_KEY],
